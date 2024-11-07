@@ -10,37 +10,6 @@ from fvcore.nn import FlopCountAnalysis, parameter_count
 from thop import profile
 from thop import clever_format
 
-
-class UNetReferModel(nn.Module):
-    def __init__(self, in_channels=3):
-        super(UNetReferModel, self).__init__()
-        self.noise_net = UNet(in_channels, in_channels, bilinear=False)
-        self.refer_net = UNet(in_channels, in_channels, bilinear=False)
-        self.score_net = ScoreModel()
-
-    def forward(self, x):
-        noise_img = self.noise_net(x)
-        score = self.score_net(noise_img)
-        refer_img = self.refer_net(x)
-        distort_img = noise_img + refer_img
-        return distort_img, refer_img, score
-
-
-class VAEReferModel(nn.Module):
-    def __init__(self, in_channels=3):
-        super(VAEReferModel, self).__init__()
-        self.noise_net = UNet(in_channels, in_channels, bilinear=False)
-        self.refer_net = VQVAE(h_dim=128, res_h_dim=32, n_res_layers=2, n_embeddings=512, embedding_dim=64, beta=0.25)
-        self.score_net = ScoreModel()
-
-    def forward(self, x):
-        noise_img = self.noise_net(x)
-        score = self.score_net(noise_img)
-        embedding_loss, refer_img, perplexity = self.refer_net(x)
-        distort_img = noise_img + refer_img
-        return distort_img, refer_img, score, embedding_loss, perplexity
-
-
 class ScoreModel(nn.Module):
     def __init__(self, model_type="vim_t", checkpoint=None):
         super(ScoreModel, self).__init__()
@@ -76,7 +45,7 @@ class ScoreModel(nn.Module):
         return x
 
 
-# 'vim_t_midclstok_ft_78p3acc' 'vim_tiny_73p1' 'deit_tiny_patch16_224-a1311bcf'
+
 class Generator(nn.Module):
     def __init__(self, in_channels=3, model_type="vim_t", checkpoint="weights/vim_tiny_73p1.pth"):
         super(Generator, self).__init__()
@@ -108,7 +77,7 @@ class Discriminator(nn.Module):
         return self.discriminator(x)
 
 
-# 'vim_t_midclstok_ft_78p3acc' 'vim_tiny_73p1' 'deit_tiny_patch16_224-a1311bcf'
+
 class VimIQAModel(nn.Module):
     def __init__(self, in_channels=3, model_type="vim_t", checkpoint="weights/vim_tiny_73p1.pth"):
         super(VimIQAModel, self).__init__()
