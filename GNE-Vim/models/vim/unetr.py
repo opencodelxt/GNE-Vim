@@ -59,20 +59,20 @@ class UNETR(nn.Module):
         self.encoder.load_state_dict(encoder_state)
 
     def __init__(
-        self,
-        img_size: int = 1024,
-        backbone: str = "sam",
-        encoder: Optional[Union[nn.Module, str]] = "vit_b",
-        decoder: Optional[nn.Module] = None,
-        out_channels: int = 1,
-        use_sam_stats: bool = False,
-        use_mae_stats: bool = False,
-        resize_input: bool = True,
-        encoder_checkpoint: Optional[Union[str, OrderedDict]] = None,
-        final_activation: Optional[Union[str, nn.Module]] = None,
-        use_skip_connection: bool = True,
-        embed_dim: Optional[int] = None,
-        use_conv_transpose=True,
+            self,
+            img_size: int = 1024,
+            backbone: str = "sam",
+            encoder: Optional[Union[nn.Module, str]] = "vit_b",
+            decoder: Optional[nn.Module] = None,
+            out_channels: int = 1,
+            use_sam_stats: bool = False,
+            use_mae_stats: bool = False,
+            resize_input: bool = True,
+            encoder_checkpoint: Optional[Union[str, OrderedDict]] = None,
+            final_activation: Optional[Union[str, nn.Module]] = None,
+            use_skip_connection: bool = True,
+            embed_dim: Optional[int] = None,
+            use_conv_transpose=True,
     ) -> None:
         super().__init__()
 
@@ -206,22 +206,34 @@ class UNETR(nn.Module):
             pixel_mean = torch.Tensor([0.0, 0.0, 0.0]).view(1, -1, 1, 1).to(device)
             pixel_std = torch.Tensor([1.0, 1.0, 1.0]).view(1, -1, 1, 1).to(device)
 
-        if self.resize_input:
-            x = self.resize_longest_side(x)
+        # 保存原始输入形状
         input_shape = x.shape[-2:]
 
+        # 对输入进行标准化
         x = (x - pixel_mean) / pixel_std
-        h, w = x.shape[-2:]
-        padh = self.encoder.img_size - h
-        padw = self.encoder.img_size - w
-        x = F.pad(x, (0, padw, 0, padh))
+
+        # 对于卷积网络，我们可能不需要调整大小和填充，因为它们通常可以处理任意大小的输入
+        # 但对于ViT/ViM，我们需要确保输入大小正确
+        if hasattr(self.encoder, 'img_size'):
+            if self.resize_input:
+                x = self.resize_longest_side(x)
+                input_shape = x.shape[-2:]
+
+            # 只有当编码器需要固定大小输入时才进行填充
+            # 例如ViT/ViM编码器
+            h, w = x.shape[-2:]
+            if h != self.encoder.img_size or w != self.encoder.img_size:
+                padh = max(0, self.encoder.img_size - h)
+                padw = max(0, self.encoder.img_size - w)
+                x = F.pad(x, (0, padw, 0, padh))
+
         return x, input_shape
 
     def postprocess_masks(
-        self,
-        masks: torch.Tensor,
-        input_size: Tuple[int, ...],
-        original_size: Tuple[int, ...],
+            self,
+            masks: torch.Tensor,
+            input_size: Tuple[int, ...],
+            original_size: Tuple[int, ...],
     ) -> torch.Tensor:
         masks = F.interpolate(
             masks,
@@ -235,34 +247,46 @@ class UNETR(nn.Module):
 
     def forward(self, x):
         if isinstance(x, tuple):
-            x1, x2 = x
-            original_shape = x1.shape[-2:]
-
-            # Reshape the inputs to the shape expected by the encoder
-            # and normalize the inputs if normalization is part of the model.
-            x1, input_shape = self.preprocess(x1)
-            x2, input_shape = self.preprocess(x2)
-            encoder_outputs = self.encoder((x1, x2))
-            x = x1 + x2
+            input_shape = torch.Size([224, 224])
+            original_shape = torch.Size([224, 224])
+            x = self.encoder(x)
+            encoder_outputs = x
         else:
             original_shape = x.shape[-2:]
             x, input_shape = self.preprocess(x)
             encoder_outputs = self.encoder(x)
-
         use_skip_connection = getattr(self, "use_skip_connection", True)
-        if isinstance(encoder_outputs[-1], list):
-            # `encoder_outputs` can be arranged in only two forms:
-            #   - either we only return the image embeddings
-            #   - or, we return the image embeddings and the "list" of global attention layers
+
+        # 处理不同类型编码器的输出格式
+        # 对于卷积编码器，输出是一个列表，包含最终特征和中间特征列表
+        # 对于ViT/ViM编码器，输出可能是单个张量或包含全局注意力层的列表
+        if isinstance(encoder_outputs, list) and len(encoder_outputs) == 2 and isinstance(encoder_outputs[1], list):
+            # 这是卷积编码器或CrossConv的输出格式 [final_features, [skip_features]]
+            z12, from_encoder = encoder_outputs
+        elif isinstance(encoder_outputs, list) and isinstance(encoder_outputs[-1], list):
+            # 这是ViT/ViM编码器的输出格式，包含全局注意力层
             z12, from_encoder = encoder_outputs
         else:
+            # 单个张量输出
             z12 = encoder_outputs
+            from_encoder = None
 
-        if use_skip_connection:
-            from_encoder = from_encoder[::-1]
-            z9 = self.deconv1(from_encoder[0])
-            z6 = self.deconv2(from_encoder[1])
-            z3 = self.deconv3(from_encoder[2])
+        if use_skip_connection and from_encoder is not None:
+            # 确保跳跃连接特征按照从深到浅的顺序
+            if not isinstance(from_encoder[0], list):  # 如果不是嵌套列表
+                from_encoder = from_encoder[::-1]
+
+            # 确保我们有足够的跳跃连接
+            if len(from_encoder) >= 3:
+                z9 = self.deconv1(from_encoder[0])
+                z6 = self.deconv2(from_encoder[1])
+                # z3 = self.deconv3(from_encoder[2])
+            else:  # 如果跳跃连接不足，使用最后一个特征图
+                last_feature = from_encoder[-1]
+                z9 = self.deconv1(last_feature)
+                z6 = self.deconv2(last_feature)
+                z3 = self.deconv3(last_feature)
+
             z0 = self.deconv4(x)
         else:
             z9 = self.deconv1(z12)
@@ -272,7 +296,14 @@ class UNETR(nn.Module):
 
         updated_from_encoder = [z9, z6, z3]
 
-        x = self.base(z12)
+        # 确保z12是正确的形状用于base层
+        # 对于卷积网络，z12可能是4D张量 [B, C, H, W]
+        # 对于ViT/ViM，z12可能是3D张量 [B, N, C]
+        if len(z12.shape) == 3:  # ViT/ViM输出
+            x = self.base(z12)
+        else:  # 卷积网络输出
+            x = self.base(z12)
+
         x = self.decoder(x, encoder_inputs=updated_from_encoder)
         x = self.deconv_out(x)
 
@@ -284,7 +315,7 @@ class UNETR(nn.Module):
             x = self.final_activation(x)
 
         x = self.postprocess_masks(x, input_shape, original_shape)
-        return x
+        return z12, x
 
 
 #

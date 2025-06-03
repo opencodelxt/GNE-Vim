@@ -1,16 +1,22 @@
 # installation from https://github.com/hustvl/Vim
 # encoder from https://github.com/hustvl/Vim
 # decoder from https://github.com/constantinpape/torch-em
+import os.path
 from functools import partial
 
-import torch
 import timm
-from torch import nn
-
-from models.vim.conv_transformer import CrossAttention, CrossConvTransformerBlock
-from models.vim.models_mamba import VisionMamba, rms_norm_fn, RMSNorm, layer_norm_fn
-from models.vim.unetr import UNETR
+import torch
 from timm.models.vision_transformer import _cfg
+from torch import nn
+import torchvision.models as models
+# import sys
+#
+# curPath = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+# sys.path.append(curPath)
+
+from models_simple.vim.conv_transformer import CrossAttention
+from models_simple.vim.models_mamba import VisionMamba, rms_norm_fn, RMSNorm, layer_norm_fn
+from models_simple.vim.unetr import UNETR
 
 
 # pretrained model weights: vim_t - https://huggingface.co/hustvl/Vim-tiny/blob/main/vim_tiny_73p1.pth
@@ -149,23 +155,16 @@ class ViM(VisionMamba):
 
 
 class CrossViM(nn.Module):
-    def __init__(self, model_type="vim_t", with_cls_token=True, checkpoint=None):
+    def __init__(self, in_channels, img_size, patch_embed, num_heads=3):
         super().__init__()
-        self.encoder1 = get_vim_encoder(model_type=model_type, with_cls_token=with_cls_token, checkpoint=checkpoint)
-        self.encoder2 = get_vim_encoder(model_type=model_type, with_cls_token=with_cls_token, checkpoint=checkpoint)
-        self.cross_attn = CrossAttention(dim=192, num_heads=3, bias=False)
-        # self.cross_attn = CrossConvTransformerBlock(dim=192, num_heads=3, ffn_expansion_factor=2, bias=False,
-        #                                              LayerNorm_type='WithBias')
-        self.img_size = self.encoder1.patch_embed.img_size[0]
-        self.default_cfg = self.encoder1.default_cfg
-        self.patch_embed = self.encoder1.patch_embed
+        self.cross_attn = CrossAttention(dim=in_channels, num_heads=num_heads, bias=False)
+        self.img_size = img_size
+        self.patch_embed = patch_embed
 
     def forward(self, x):
         x1, x2 = x
-        x1 = self.encoder1(x1)
-        x2 = self.encoder2(x2)
-        x = self.cross_attn(x1, x2, x2)
-        return x
+        return self.cross_attn(x1, x2, x2)
+        # return x1 + x2
 
 
 def get_vim_encoder(model_type="vim_t", with_cls_token=True, checkpoint=None):
@@ -180,6 +179,8 @@ def get_vim_encoder(model_type="vim_t", with_cls_token=True, checkpoint=None):
       * if_rope=False
       * stride=8
     """
+    if model_type == "vgg16" or model_type == "resnet50":
+        return get_conv_encoder(model_type=model_type, pretrained=True, checkpoint=None)
     if checkpoint is None:
         if_rope = True
         stride = 16
@@ -242,8 +243,10 @@ def get_vim_encoder(model_type="vim_t", with_cls_token=True, checkpoint=None):
 
 
 def get_vimunet_model(
-        out_channels, model_type="vim_t", with_cls_token=True, device=None, checkpoint=None
+        out_channels, model_type="vim_t", with_cls_token=True, checkpoint=None,
 ):
+    if model_type == "vgg16" or model_type == "resnet50":
+        return get_conv_model(out_channels, model_type=model_type, pretrained=True, checkpoint=None)
     encoder = get_vim_encoder(model_type, with_cls_token, checkpoint=checkpoint)
 
     model_state = None
@@ -267,8 +270,8 @@ def get_vimunet_model(
     return model
 
 
-def get_cross_vimunet_model(out_channels, model_type="vim_t", with_cls_token=True, checkpoint=None):
-    encoder = CrossViM(model_type=model_type, with_cls_token=with_cls_token, checkpoint=checkpoint)
+def get_cross_vimunet_model(in_channels, out_channels, img_size, patch_embed, num_heads=3):
+    encoder = CrossViM(in_channels, img_size, patch_embed, num_heads=num_heads)
     model = UNETR(
         encoder=encoder,
         out_channels=out_channels,
@@ -279,10 +282,137 @@ def get_cross_vimunet_model(out_channels, model_type="vim_t", with_cls_token=Tru
     return model
 
 
+def get_conv_encoder(model_type="vgg16", pretrained=True, checkpoint=None):
+    """
+    获取基于卷积网络的编码器
+    
+    Args:
+        model_type: 卷积网络类型，支持 "vgg16" 或 "resnet50"
+        pretrained: 是否使用预训练权重
+        checkpoint: 自定义权重文件路径
+    
+    Returns:
+        编码器模型
+    """
+    if model_type == "vgg16":
+        encoder = models.vgg16(pretrained=pretrained).features
+        # 设置图像大小属性，以便与UNETR兼容
+        encoder.img_size = 224
+        # 设置输出特征维度
+        encoder.embed_dim = 512
+    elif model_type == "resnet50":
+        # 移除最后的全连接层
+        encoder = nn.Sequential(*list(models.resnet50(pretrained=pretrained).children())[:-2])
+        # 设置图像大小属性，以便与UNETR兼容
+        encoder.img_size = 224
+        # 设置输出特征维度
+        encoder.embed_dim = 2048
+    else:
+        raise ValueError("Choose from 'vgg16' or 'resnet50'")
+
+    # 添加forward方法以返回特征图和中间特征列表
+    class ConvEncoderWrapper(nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+            self.img_size = encoder.img_size
+            self.embed_dim = encoder.embed_dim
+
+            # 添加patch_embed属性以兼容UNETR类的接口
+            # 创建一个简单的占位符对象，具有img_size属性
+            class PatchEmbedPlaceholder:
+                def __init__(self, img_size):
+                    self.img_size = [img_size, img_size]
+
+                    # 添加proj属性以兼容UNETR类的接口
+                    class ProjPlaceholder:
+                        def __init__(self):
+                            pass
+
+                    self.proj = ProjPlaceholder()
+                    # 设置out_channels属性为编码器的embed_dim
+                    self.proj.out_channels = encoder.embed_dim
+                    self.proj.in_channels = 3  # 假设输入是RGB图像
+
+            self.patch_embed = PatchEmbedPlaceholder(self.img_size)
+
+        def forward(self, x):
+            # 对于VGG16，我们可以在不同深度获取特征
+            if isinstance(self.encoder, models.vgg16().features.__class__):
+                features = []
+                for i, layer in enumerate(self.encoder):
+                    x = layer(x)
+                    # 在每个池化层后保存特征
+                    if isinstance(layer, nn.MaxPool2d):
+                        features.append(x)
+                # 返回最终特征和中间特征列表
+                return x
+            # 对于ResNet，我们需要在每个阶段后获取特征
+            else:
+                # 假设这是ResNet
+                features = []
+                # 对于ResNet，我们需要手动提取中间特征
+                x = self.encoder[0](x)  # conv1
+                x = self.encoder[1](x)  # bn1
+                x = self.encoder[2](x)  # relu
+                x = self.encoder[3](x)  # maxpool
+
+                # layer1
+                x = self.encoder[4](x)
+                features.append(x)
+
+                # layer2
+                x = self.encoder[5](x)
+                features.append(x)
+
+                # layer3
+                x = self.encoder[6](x)
+                features.append(x)
+
+                # layer4
+                x = self.encoder[7](x)
+
+                # 返回最终特征和中间特征列表
+                return x
+
+    wrapped_encoder = ConvEncoderWrapper(encoder)
+
+    if checkpoint is not None:
+        state = torch.load(checkpoint, map_location="cpu")
+        wrapped_encoder.load_state_dict(state)
+
+    return wrapped_encoder
+
+
+def get_conv_model(out_channels, model_type="vgg16", pretrained=True, checkpoint=None):
+    """
+    获取基于卷积网络的UNETR模型
+    
+    Args:
+        out_channels: 输出通道数
+        model_type: 卷积网络类型，支持 "vgg16" 或 "resnet50"
+        pretrained: 是否使用预训练权重
+        checkpoint: 自定义权重文件路径
+    
+    Returns:
+        UNETR模型
+    """
+    encoder = get_conv_encoder(model_type=model_type, pretrained=pretrained, checkpoint=checkpoint)
+
+    model = UNETR(
+        encoder=encoder,
+        out_channels=out_channels,
+        resize_input=False,
+        use_skip_connection=False,  # 对于卷积网络，使用跳跃连接
+        final_activation="Sigmoid",
+    )
+
+    return model
+
+
 if __name__ == '__main__':
-    # test get_cross_vimunet_model
-    model = get_vimunet_model(out_channels=3, model_type="vit_t", with_cls_token=True,
-                              checkpoint='../../weights/deit_tiny_patch16_224-a1311bcf.pth')
+    model = get_vimunet_model(out_channels=3, model_type="vim_t",
+                              checkpoint="../../weights/vim_t_midclstok_ft_78p3acc.pth")
     model.eval()
     x = torch.rand(2, 3, 224, 224)
     y = torch.rand(2, 3, 224, 224)
@@ -293,3 +423,11 @@ if __name__ == '__main__':
     with torch.no_grad():
         out = model(x)
         print(out.shape)
+
+    # 测试卷积模型
+    conv_model = get_conv_model(out_channels=3, model_type="vgg16")
+    conv_model.eval()
+    conv_model.to(device)
+    with torch.no_grad():
+        out = conv_model(x)
+        print(f"Conv model output shape: {out.shape}")

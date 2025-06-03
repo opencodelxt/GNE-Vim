@@ -155,8 +155,8 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, y, z):
         b, c, h, w = x.shape
-        # q, k, v = self.q(x), self.k(y), self.v(z)
-        q, k, v = x, y, z
+        q, k, v = self.q(x), self.k(y), self.v(z)
+        # q, k, v = x, y, z
         q = rearrange(q, 'b (head c) h w -> b head c (h w)',
                       head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)',
@@ -177,76 +177,6 @@ class CrossAttention(nn.Module):
 
         out = self.project_out(out)
         return out
-
-
-class AttentionBase(nn.Module):
-    def __init__(self,
-                 dim,
-                 num_heads=8,
-                 qkv_bias=False, ):
-        super(AttentionBase, self).__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.qkv1 = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=qkv_bias)
-        self.qkv2 = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, bias=qkv_bias)
-        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=qkv_bias)
-
-    def forward(self, x):
-        # [batch_size, num_patches + 1, total_embed_dim]
-        b, c, h, w = x.shape
-        qkv = self.qkv2(self.qkv1(x))
-        q, k, v = qkv.chunk(3, dim=1)
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)',
-                      head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)',
-                      head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)',
-                      head=self.num_heads)
-        q = torch.nn.functional.normalize(q, dim=-1)
-        k = torch.nn.functional.normalize(k, dim=-1)
-        # transpose: -> [batch_size, num_heads, embed_dim_per_head, num_patches + 1]
-        # @: multiply -> [batch_size, num_heads, num_patches + 1, num_patches + 1]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        out = (attn @ v)
-
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w',
-                        head=self.num_heads, h=h, w=w)
-
-        out = self.proj(out)
-        return out
-
-
-class Mlp(nn.Module):
-    """
-    MLP as used in Vision Transformer, MLP-Mixer and related networks
-    """
-
-    def __init__(self,
-                 in_features,
-                 hidden_features=None,
-                 ffn_expansion_factor=2,
-                 bias=False):
-        super().__init__()
-        hidden_features = int(in_features * ffn_expansion_factor)
-
-        self.project_in = nn.Conv2d(
-            in_features, hidden_features * 2, kernel_size=1, bias=bias)
-
-        self.dwconv = nn.Conv2d(hidden_features * 2, hidden_features * 2, kernel_size=3,
-                                stride=1, padding=1, groups=hidden_features, bias=bias)
-
-        self.project_out = nn.Conv2d(
-            hidden_features, in_features, kernel_size=1, bias=bias)
-
-    def forward(self, x):
-        x = self.project_in(x)
-        x1, x2 = self.dwconv(x).chunk(2, dim=1)
-        x = F.gelu(x1) * x2
-        x = self.project_out(x)
-        return x
 
 
 class TransformerBlock(nn.Module):
@@ -280,88 +210,3 @@ class CrossConvTransformerBlock(nn.Module):
         y = y + self.attn1(norm_y, norm_y, norm_x)
         y = y + self.ffn(self.norm2(y))
         return y
-
-
-class RevFormerBlock(nn.Module):
-    def __init__(self, dim, num_heads, ffn_expansion_factor=1, qkv_bias=False, ):
-        super(RevFormerBlock, self).__init__()
-        self.norm1 = LayerNorm(dim, 'WithBias')
-        self.attn = AttentionBase(dim, num_heads=num_heads, qkv_bias=qkv_bias)
-        self.norm2 = LayerNorm(dim, 'WithBias')
-        self.mlp = Mlp(in_features=dim, ffn_expansion_factor=ffn_expansion_factor, )
-
-    def separateFeature(self, x):
-        z1, z2 = x[:, :x.shape[1] // 2], x[:, x.shape[1] // 2:x.shape[1]]
-        return z1, z2
-
-    def forward(self, z1, z2, rev=False):
-        if not rev:
-            z1 = z1 + self.attn(self.norm1(z2))
-            z2 = z2 + self.mlp(self.norm2(z1))
-            return z1, z2
-        else:
-            z2 = z2 - self.mlp(self.norm2(z1))
-            z1 = z1 - self.attn(self.norm1(z2))
-            return z1, z2
-
-
-class InvertedResidualBlock(nn.Module):
-    def __init__(self, inp, oup, expand_ratio):
-        super(InvertedResidualBlock, self).__init__()
-        hidden_dim = int(inp * expand_ratio)
-        self.bottleneckBlock = nn.Sequential(
-            # pw
-            nn.Conv2d(inp, hidden_dim, 1, bias=False),
-            # nn.BatchNorm2d(hidden_dim),
-            nn.ReLU6(inplace=True),
-            # dw
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, groups=hidden_dim, bias=False),
-            # nn.BatchNorm2d(hidden_dim),
-            nn.ReLU6(inplace=True),
-            # pw-linear
-            nn.Conv2d(hidden_dim, oup, 1, bias=False),
-            # nn.BatchNorm2d(oup),
-        )
-
-    def forward(self, x):
-        return self.bottleneckBlock(x)
-
-
-class DetailNode(nn.Module):
-    def __init__(self, dim=32):
-        super(DetailNode, self).__init__()
-        # Scale is Ax + b, i.e. affine transformation
-        self.theta_phi = InvertedResidualBlock(inp=dim, oup=dim, expand_ratio=2)
-        self.theta_rho = InvertedResidualBlock(inp=dim, oup=dim, expand_ratio=2)
-        self.theta_eta = InvertedResidualBlock(inp=dim, oup=dim, expand_ratio=2)
-
-    def forward(self, z1, z2, rev=False):
-        if not rev:
-            z2 = z2 + self.theta_phi(z1)
-            z1 = z1 * torch.exp(self.theta_rho(z2)) + self.theta_eta(z2)
-            return z1, z2
-        else:
-            z1 = (z1 - self.theta_eta(z2)) * torch.exp(-self.theta_rho(z2))
-            z2 = z2 - self.theta_phi(z1)
-            return z1, z2
-
-
-class INN(nn.Module):
-    def __init__(self, dim=32, num_layers=3):
-        super(INN, self).__init__()
-        INNmodules = [DetailNode(dim=dim) for _ in range(num_layers)]
-        self.net = nn.Sequential(*INNmodules)
-        self.shuffle_conv = nn.Conv2d(dim * 2, dim * 2, kernel_size=1,
-                                      stride=1, padding=0, bias=True)
-
-    @staticmethod
-    def separate_feature(x):
-        z1, z2 = x[:, :x.shape[1] // 2], x[:, x.shape[1] // 2:x.shape[1]]
-        return z1, z2
-
-    def forward(self, z1, z2, rev=False):
-        z1, z2 = self.separate_feature(self.shuffle_conv(torch.cat((z1, z2), dim=1)))
-        for layer in self.net:
-            z1, z2 = layer(z1, z2, rev)
-        return z1, z2
