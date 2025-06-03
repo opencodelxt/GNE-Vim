@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchvision
 from torch import nn
 
-from models_simple.vim.vim import get_vimunet_model, get_cross_vimunet_model, get_vim_encoder
+from models.vim.vim import get_vimunet_model, get_cross_vimunet_model, get_vim_encoder
 
 
 class ScoreModel(nn.Module):
